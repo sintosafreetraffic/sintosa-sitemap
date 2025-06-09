@@ -5,88 +5,103 @@ import datetime
 import time
 import boto3
 import subprocess
+import logging
+import urllib.robotparser
+from collections import deque
+
+# Constants
 BASE_URL = 'https://sintosa.de'
 SITEMAP_FILE = 'sitemap.xml'
 CRAWL_LIMIT = 10000
 REQUEST_DELAY = 0.5
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
+             "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
-# S3 Config
-S3_BUCKET = 'your-s3-bucket-name'      # e.g. 'sintosa-sitemaps'
-S3_KEY = 'sitemap.xml'                 # The file name in S3
-S3_REGION = 'eu-central-1'             # Change to your AWS S3 region
+# AWS S3 Config
+S3_BUCKET = 'your-s3-bucket-name'
+S3_KEY = 'sitemap.xml'
+S3_REGION = 'eu-central-1'
 
-# Make sure you have AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in your environment,
-# or configure AWS CLI with `aws configure`.
+# Setup logger
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
-def is_internal(url, base_netloc):
-    return urlparse(url).netloc == base_netloc or urlparse(url).netloc == ""
+# Initialize robots.txt parser
+rp = urllib.robotparser.RobotFileParser()
+rp.set_url(urljoin(BASE_URL, "/robots.txt"))
+rp.read()
 
-def normalize_url(url):
+def normalize_url(url: str) -> str:
     parsed = urlparse(url)
-    clean = parsed._replace(fragment="").geturl()
-    if clean.endswith('/') and clean != BASE_URL + '/':
-        clean = clean[:-1]
-    return clean
+    scheme = parsed.scheme.lower() or "https"
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip('/')
+    normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path, query='', fragment='').geturl()
+    return normalized
 
-def crawl_site(start_url):
-    print(f"[DEBUG] Entered crawl_site for: {start_url}")
+def is_internal(url: str, base_netloc: str) -> bool:
+    parsed_netloc = urlparse(url).netloc
+    return parsed_netloc == base_netloc or parsed_netloc == ""
+
+def crawl_site(start_url: str):
     base_netloc = urlparse(start_url).netloc
-    to_visit = set([start_url])
+    to_visit = deque([start_url])
     visited = set()
     all_urls = set()
     session = requests.Session()
 
-    crawl_round = 0
-    print(f"[INIT] Starting crawl at {start_url}")
+    logger.info(f"Starting crawl at {start_url}")
+
     while to_visit and len(visited) < CRAWL_LIMIT:
-        crawl_round += 1
-        url = to_visit.pop()
+        url = to_visit.popleft()
         url = normalize_url(url)
+
         if url in visited:
-            print(f"[SKIP] Already visited: {url}")
+            logger.debug(f"Already visited: {url}")
             continue
-        print(f"\n[VISIT {len(visited)+1}/{CRAWL_LIMIT}] Fetching: {url}")
-        print(f"        Visited: {len(visited)} | Queue: {len(to_visit)} | Round: {crawl_round}")
+
+        # Check robots.txt permission
+        if not rp.can_fetch(USER_AGENT, url):
+            logger.info(f"Disallowed by robots.txt: {url}")
+            continue
+
+        logger.info(f"Visiting ({len(visited)+1}/{CRAWL_LIMIT}): {url}")
         visited.add(url)
         all_urls.add(url)
+
         try:
-            print(f"[DEBUG] Preparing to request: {url}")
-            resp = session.get(url, timeout=10, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-            })
-            print(f"[DEBUG] Got response: {resp.status_code}")
+            resp = session.get(url, timeout=10, headers={"User-Agent": USER_AGENT})
             if not resp.ok or "text/html" not in resp.headers.get("Content-Type", ""):
-                print(f"[SKIP] Non-HTML or Bad response at: {url} (type: {resp.headers.get('Content-Type')})")
+                logger.info(f"Skipping non-HTML or bad response: {url}")
                 continue
+
             soup = BeautifulSoup(resp.text, "html.parser")
             found_links = 0
+
             for link in soup.find_all("a", href=True):
                 href = link["href"].strip()
                 if href.startswith(("mailto:", "tel:", "javascript:")):
-                    print(f"    [SKIP LINK] Non-HTTP ({href})")
                     continue
                 abs_url = urljoin(BASE_URL, href)
                 abs_url = normalize_url(abs_url)
                 if not is_internal(abs_url, base_netloc):
-                    print(f"    [SKIP LINK] External ({abs_url})")
                     continue
                 if abs_url in visited or abs_url in to_visit:
-                    print(f"    [SKIP LINK] Already queued or visited: {abs_url}")
                     continue
-                to_visit.add(abs_url)
+                to_visit.append(abs_url)
                 found_links += 1
-                print(f"    [ADD LINK] Queued for visit: {abs_url}")
-            print(f"[INFO] {url}: Found {found_links} new links. Queue: {len(to_visit)}")
-            print(f"[SLEEP] Pausing {REQUEST_DELAY} sec to be polite...")
-            time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            print(f"[ERROR] Visiting {url}: {e}")
 
-    print(f"\n[DONE] Crawl finished. Total visited: {len(visited)} URLs.\n")
+            logger.info(f"Found {found_links} new links, queue size: {len(to_visit)}")
+            time.sleep(REQUEST_DELAY)
+
+        except Exception as e:
+            logger.error(f"Error visiting {url}: {e}")
+
+    logger.info(f"Crawl finished. Visited {len(visited)} URLs")
     return sorted(all_urls)
 
 def generate_sitemap(urls, outfile=SITEMAP_FILE):
-    print(f"[SITEMAP] Writing sitemap to {outfile} ({len(urls)} URLs)")
+    logger.info(f"Writing sitemap to {outfile} ({len(urls)} URLs)")
     with open(outfile, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
@@ -99,37 +114,37 @@ def generate_sitemap(urls, outfile=SITEMAP_FILE):
             f.write('    <priority>0.5</priority>\n')
             f.write('  </url>\n')
         f.write('</urlset>\n')
-    print(f"\n✅ Sitemap generated: {outfile} ({len(urls)} URLs)\n")
+    logger.info(f"Sitemap generated: {outfile} ({len(urls)} URLs)")
 
 def upload_to_s3(local_file, bucket, key, region):
-    print(f"[S3] Uploading {local_file} to s3://{bucket}/{key}")
+    logger.info(f"Uploading {local_file} to s3://{bucket}/{key}")
     s3 = boto3.client('s3', region_name=region)
     try:
         s3.upload_file(local_file, bucket, key, ExtraArgs={'ACL': 'public-read', 'ContentType': 'application/xml'})
         url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-        print(f"[S3] ✅ Uploaded successfully! Public URL: {url}")
+        logger.info(f"Upload successful! Public URL: {url}")
         return url
     except Exception as e:
-        print(f"[S3] ❌ Upload failed: {e}")
+        logger.error(f"Upload failed: {e}")
         return None
 
 if __name__ == "__main__":
-    print(f"[START] Crawling: {BASE_URL}")
+    logger.info(f"Starting crawl of: {BASE_URL}")
     urls = crawl_site(BASE_URL)
-    print(f"\n[RESULT] Total unique URLs found: {len(urls)}\n")
+    logger.info(f"Total unique URLs found: {len(urls)}")
+
     generate_sitemap(urls)
-    # --- Upload to S3 ---
+
     sitemap_url = upload_to_s3(SITEMAP_FILE, S3_BUCKET, S3_KEY, S3_REGION)
     if sitemap_url:
-        print(f"\n[SITEMAP PUBLIC URL] → {sitemap_url}")
-        print("Submit this URL to Google Search Console as an extra sitemap!\n")
+        logger.info(f"Sitemap public URL: {sitemap_url}")
+        logger.info("Submit this URL to Google Search Console!")
     else:
-        print("Failed to upload sitemap. Please check credentials and bucket configuration.")
+        logger.error("Failed to upload sitemap. Check credentials and bucket configuration.")
 
-    print("[INFO] Sitemap generated, now pushing to GitHub repo...")
-
+    logger.info("Pushing sitemap to GitHub repo...")
     result = subprocess.run(['python3', 'upload_only.py'])
     if result.returncode == 0:
-        print("[INFO] Sitemap pushed successfully!")
+        logger.info("Sitemap pushed successfully!")
     else:
-        print("[ERROR] Failed to push sitemap to GitHub repo.")
+        logger.error("Failed to push sitemap to GitHub repo.")
