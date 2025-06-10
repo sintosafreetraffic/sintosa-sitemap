@@ -3,39 +3,44 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import datetime
 import time
-import boto3
 import subprocess
 import logging
 import urllib.robotparser
 from collections import deque
+from requests.adapters import HTTPAdapter, Retry
+from typing import Set, List
 
 # Constants
 BASE_URL = 'https://sintosa.de'
 SITEMAP_FILE = 'sitemap.xml'
 CRAWL_LIMIT = 10000
 REQUEST_DELAY = 0.5
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
-             "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-
-# AWS S3 Config
-S3_BUCKET = 'your-s3-bucket-name'
-S3_KEY = 'sitemap.xml'
-S3_REGION = 'eu-central-1'
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
 
 # Setup logger
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize robots.txt parser
-rp = urllib.robotparser.RobotFileParser()
-rp.set_url(urljoin(BASE_URL, "/robots.txt"))
-rp.read()
+def setup_robots_parser(base_url: str) -> urllib.robotparser.RobotFileParser:
+    rp = urllib.robotparser.RobotFileParser()
+    robots_url = urljoin(base_url, "/robots.txt")
+    rp.set_url(robots_url)
+    try:
+        rp.read()
+        logger.info(f"Robots.txt loaded from {robots_url}")
+    except Exception as e:
+        logger.warning(f"Failed to load robots.txt: {e}")
+    return rp
 
 def normalize_url(url: str) -> str:
     parsed = urlparse(url)
     scheme = parsed.scheme.lower() or "https"
     netloc = parsed.netloc.lower()
-    path = parsed.path.rstrip('/')
+    # Remove trailing slash except for root URL
+    path = parsed.path if parsed.path == "/" else parsed.path.rstrip('/')
     normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path, query='', fragment='').geturl()
     return normalized
 
@@ -43,16 +48,25 @@ def is_internal(url: str, base_netloc: str) -> bool:
     parsed_netloc = urlparse(url).netloc
     return parsed_netloc == base_netloc or parsed_netloc == ""
 
-def crawl_site(start_url: str):
+def crawl_site(start_url: str, crawl_limit: int, request_delay: float, user_agent: str) -> List[str]:
     base_netloc = urlparse(start_url).netloc
     to_visit = deque([start_url])
-    visited = set()
-    all_urls = set()
+    visited: Set[str] = set()
+    all_urls: Set[str] = set()
     session = requests.Session()
+
+    # Add retry strategy for robustness
+    retries = Retry(total=3, backoff_factor=1,
+                    status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    rp = setup_robots_parser(start_url)
 
     logger.info(f"Starting crawl at {start_url}")
 
-    while to_visit and len(visited) < CRAWL_LIMIT:
+    while to_visit and len(visited) < crawl_limit:
         url = to_visit.popleft()
         url = normalize_url(url)
 
@@ -61,16 +75,16 @@ def crawl_site(start_url: str):
             continue
 
         # Check robots.txt permission
-        if not rp.can_fetch(USER_AGENT, url):
+        if not rp.can_fetch(user_agent, url):
             logger.info(f"Disallowed by robots.txt: {url}")
             continue
 
-        logger.info(f"Visiting ({len(visited)+1}/{CRAWL_LIMIT}): {url}")
+        logger.info(f"Visiting ({len(visited)+1}/{crawl_limit}): {url}")
         visited.add(url)
         all_urls.add(url)
 
         try:
-            resp = session.get(url, timeout=10, headers={"User-Agent": USER_AGENT})
+            resp = session.get(url, timeout=10, headers={"User-Agent": user_agent})
             if not resp.ok or "text/html" not in resp.headers.get("Content-Type", ""):
                 logger.info(f"Skipping non-HTML or bad response: {url}")
                 continue
@@ -92,7 +106,7 @@ def crawl_site(start_url: str):
                 found_links += 1
 
             logger.info(f"Found {found_links} new links, queue size: {len(to_visit)}")
-            time.sleep(REQUEST_DELAY)
+            time.sleep(request_delay)
 
         except Exception as e:
             logger.error(f"Error visiting {url}: {e}")
@@ -100,7 +114,7 @@ def crawl_site(start_url: str):
     logger.info(f"Crawl finished. Visited {len(visited)} URLs")
     return sorted(all_urls)
 
-def generate_sitemap(urls, outfile=SITEMAP_FILE):
+def generate_sitemap(urls: List[str], outfile: str = SITEMAP_FILE) -> None:
     logger.info(f"Writing sitemap to {outfile} ({len(urls)} URLs)")
     with open(outfile, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
@@ -116,35 +130,14 @@ def generate_sitemap(urls, outfile=SITEMAP_FILE):
         f.write('</urlset>\n')
     logger.info(f"Sitemap generated: {outfile} ({len(urls)} URLs)")
 
-def upload_to_s3(local_file, bucket, key, region):
-    logger.info(f"Uploading {local_file} to s3://{bucket}/{key}")
-    s3 = boto3.client('s3', region_name=region)
-    try:
-        s3.upload_file(local_file, bucket, key, ExtraArgs={'ACL': 'public-read', 'ContentType': 'application/xml'})
-        url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-        logger.info(f"Upload successful! Public URL: {url}")
-        return url
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        return None
-
-if __name__ == "__main__":
+def main():
     logger.info(f"Starting crawl of: {BASE_URL}")
-    urls = crawl_site(BASE_URL)
+    urls = crawl_site(BASE_URL, CRAWL_LIMIT, REQUEST_DELAY, USER_AGENT)
     logger.info(f"Total unique URLs found: {len(urls)}")
 
     generate_sitemap(urls)
 
-    sitemap_url = upload_to_s3(SITEMAP_FILE, S3_BUCKET, S3_KEY, S3_REGION)
-    if sitemap_url:
-        logger.info(f"Sitemap public URL: {sitemap_url}")
-        logger.info("Submit this URL to Google Search Console!")
-    else:
-        logger.error("Failed to upload sitemap. Check credentials and bucket configuration.")
+    subprocess.run(['python3', 'upload_only.py'])
 
-    logger.info("Pushing sitemap to GitHub repo...")
-    result = subprocess.run(['python3', 'upload_only.py'])
-    if result.returncode == 0:
-        logger.info("Sitemap pushed successfully!")
-    else:
-        logger.error("Failed to push sitemap to GitHub repo.")
+if __name__ == "__main__":
+    main()
